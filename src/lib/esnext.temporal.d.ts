@@ -17,6 +17,11 @@ declare var Temporal: TemporalConstructor;
 
 declare namespace Temporal {
     interface Now {
+        instant(): Instant;
+        timeZoneId(): string;
+        plainDateTimeISO(timeZone: object | string): PlainDateTime
+        plainDateISO(timeZone: object | string): PlainDate
+        plainTimeISO(timeZone: object | string): PlainTime
     }
 
     interface Instant {
