@@ -29416,6 +29416,7 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
             const iterate = !!(declaredType.flags & TypeFlags.Union);
             const maxPasses = iterate ? (declaredType as UnionType).types.length + 1 : 1;
             const sharedFlowCountAtEntry = sharedFlowCount;
+            const flowLoopCountAtEntry = flowLoopCount;
             let antecedentTypes: Type[] = [];
             let subtypeReduction = false;
             let firstAntecedentType: FlowType | undefined;
@@ -29486,6 +29487,15 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
             // is incomplete.
             if (isIncomplete(firstAntecedentType!)) {
                 return createFlowType(result, /*incomplete*/ true);
+            }
+            // If an enclosing loop junction's in-process types were observed while this junction was
+            // being computed, the result may derive from a partial union whose incomplete marker was
+            // lost across an expression boundary. Don't cache it: the enclosing junction may retry,
+            // and once it completes a later query recomputes this junction from the final type.
+            for (let i = flowLoopStart; i < flowLoopCountAtEntry; i++) {
+                if (flowLoopReentered[i]) {
+                    return result;
+                }
             }
             cache.set(key, result);
             return result;
