@@ -2360,6 +2360,7 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
     var flowLoopNodes: FlowNode[] = [];
     var flowLoopKeys: string[] = [];
     var flowLoopTypes: Type[][] = [];
+    var flowLoopReentered: boolean[] = [];
     var sharedFlowNodes: FlowNode[] = [];
     var sharedFlowTypes: FlowType[] = [];
     var flowNodeReachable: (boolean | undefined)[] = [];
@@ -29393,59 +29394,96 @@ export function createTypeChecker(host: TypeCheckerHost): TypeChecker {
             // path that leads to the top.
             for (let i = flowLoopStart; i < flowLoopCount; i++) {
                 if (flowLoopNodes[i] === flow && flowLoopKeys[i] === key && flowLoopTypes[i].length) {
+                    // Record that the in-process result was observed so that the junction being
+                    // computed knows its looping antecedents were derived from a partial type.
+                    flowLoopReentered[i] = true;
                     return createFlowType(getUnionOrEvolvingArrayType(flowLoopTypes[i], UnionReduction.Literal), /*incomplete*/ true);
                 }
             }
             // Add the flow loop junction and reference to the in-process stack and analyze
             // each antecedent code path.
-            const antecedentTypes: Type[] = [];
+            //
+            // When the declared type is a union, an assignment in the loop body narrows the declared
+            // type by the assigned type, and computing the assigned type may read the reference itself
+            // (e.g. 'x = x.next'). Such a read re-enters this junction and observes the in-process
+            // (partial) union, and the incomplete marker on that observation is lost once it crosses
+            // the expression checker boundary. A single pass therefore computes only one application
+            // of the loop's transfer function. To reach a fixpoint, we re-run the antecedent pass with
+            // the current result as the in-process approximation whenever a looping antecedent re-entered
+            // this junction and the result grew. Each pass can only add constituents of the declared
+            // union, so the number of passes is bounded by the union's size; if the bound is reached,
+            // we fall back to the declared type.
+            const iterate = !!(declaredType.flags & TypeFlags.Union);
+            const maxPasses = iterate ? (declaredType as UnionType).types.length + 1 : 1;
+            const sharedFlowCountAtEntry = sharedFlowCount;
+            let antecedentTypes: Type[] = [];
             let subtypeReduction = false;
             let firstAntecedentType: FlowType | undefined;
-            for (const antecedent of flow.antecedent!) {
-                let flowType;
-                if (!firstAntecedentType) {
-                    // The first antecedent of a loop junction is always the non-looping control
-                    // flow path that leads to the top.
-                    flowType = firstAntecedentType = getTypeAtFlowNode(antecedent);
-                }
-                else {
-                    // All but the first antecedent are the looping control flow paths that lead
-                    // back to the loop junction. We track these on the flow loop stack.
-                    flowLoopNodes[flowLoopCount] = flow;
-                    flowLoopKeys[flowLoopCount] = key;
-                    flowLoopTypes[flowLoopCount] = antecedentTypes;
-                    flowLoopCount++;
-                    const saveFlowTypeCache = flowTypeCache;
-                    flowTypeCache = undefined;
-                    flowType = getTypeAtFlowNode(antecedent);
-                    flowTypeCache = saveFlowTypeCache;
-                    flowLoopCount--;
-                    // If we see a value appear in the cache it is a sign that control flow analysis
-                    // was restarted and completed by checkExpressionCached. We can simply pick up
-                    // the resulting type and bail out.
-                    const cached = cache.get(key);
-                    if (cached) {
-                        return cached;
+            let result: Type | undefined;
+            for (let pass = 1;; pass++) {
+                let reentered = false;
+                firstAntecedentType = undefined;
+                for (const antecedent of flow.antecedent!) {
+                    let flowType;
+                    if (!firstAntecedentType) {
+                        // The first antecedent of a loop junction is always the non-looping control
+                        // flow path that leads to the top.
+                        flowType = firstAntecedentType = getTypeAtFlowNode(antecedent);
+                    }
+                    else {
+                        // All but the first antecedent are the looping control flow paths that lead
+                        // back to the loop junction. We track these on the flow loop stack.
+                        flowLoopNodes[flowLoopCount] = flow;
+                        flowLoopKeys[flowLoopCount] = key;
+                        flowLoopTypes[flowLoopCount] = antecedentTypes;
+                        flowLoopReentered[flowLoopCount] = false;
+                        flowLoopCount++;
+                        const saveFlowTypeCache = flowTypeCache;
+                        flowTypeCache = undefined;
+                        flowType = getTypeAtFlowNode(antecedent);
+                        flowTypeCache = saveFlowTypeCache;
+                        flowLoopCount--;
+                        reentered ||= flowLoopReentered[flowLoopCount];
+                        // If we see a value appear in the cache it is a sign that control flow analysis
+                        // was restarted and completed by checkExpressionCached. We can simply pick up
+                        // the resulting type and bail out.
+                        const cached = cache.get(key);
+                        if (cached) {
+                            return cached;
+                        }
+                    }
+                    const type = getTypeFromFlowType(flowType);
+                    pushIfUnique(antecedentTypes, type);
+                    // If an antecedent type is not a subset of the declared type, we need to perform
+                    // subtype reduction. This happens when a "foreign" type is injected into the control
+                    // flow using the instanceof operator or a user defined type predicate.
+                    if (!isTypeSubsetOf(type, initialType)) {
+                        subtypeReduction = true;
+                    }
+                    // If the type at a particular antecedent path is the declared type there is no
+                    // reason to process more antecedents since the only possible outcome is subtypes
+                    // that will be removed in the final union type anyway.
+                    if (type === declaredType) {
+                        break;
                     }
                 }
-                const type = getTypeFromFlowType(flowType);
-                pushIfUnique(antecedentTypes, type);
-                // If an antecedent type is not a subset of the declared type, we need to perform
-                // subtype reduction. This happens when a "foreign" type is injected into the control
-                // flow using the instanceof operator or a user defined type predicate.
-                if (!isTypeSubsetOf(type, initialType)) {
-                    subtypeReduction = true;
-                }
-                // If the type at a particular antecedent path is the declared type there is no
-                // reason to process more antecedents since the only possible outcome is subtypes
-                // that will be removed in the final union type anyway.
-                if (type === declaredType) {
+                const previous = result;
+                result = getUnionOrEvolvingArrayType(antecedentTypes, subtypeReduction ? UnionReduction.Subtype : UnionReduction.Literal);
+                // Stop once the result no longer grows. Results that differ only in literal freshness are
+                // considered equal, since another pass would observe the same set of constituents.
+                if (!iterate || !reentered || isIncomplete(firstAntecedentType!) || previous && getRegularTypeOfLiteralType(result) === getRegularTypeOfLiteralType(previous)) {
                     break;
                 }
+                if (pass >= maxPasses) {
+                    result = declaredType;
+                    break;
+                }
+                // Discard shared flow node types computed from the partial result during this pass.
+                sharedFlowCount = sharedFlowCountAtEntry;
+                antecedentTypes = [result];
             }
             // The result is incomplete if the first antecedent (the non-looping control flow path)
             // is incomplete.
-            const result = getUnionOrEvolvingArrayType(antecedentTypes, subtypeReduction ? UnionReduction.Subtype : UnionReduction.Literal);
             if (isIncomplete(firstAntecedentType!)) {
                 return createFlowType(result, /*incomplete*/ true);
             }
